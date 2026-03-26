@@ -76,7 +76,7 @@ describe('findExistingGatewayProcess', () => {
     const { sandbox, listProcessesMock } = createMockSandbox();
     listProcessesMock.mockResolvedValue([gatewayProcess]);
 
-    const result = await findExistingMoltbotProcess(sandbox);
+    const result = await findExistingGatewayProcess(sandbox);
     expect(result).toBe(gatewayProcess);
   });
 
