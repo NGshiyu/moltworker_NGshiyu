@@ -259,62 +259,30 @@ app.all('*', async (c) => {
 
   console.log('[PROXY] Handling request:', url.pathname);
 
-  // Check if gateway is already running (with timeout to avoid hanging on cold start)
-  let existingProcess = null;
-  try {
-    existingProcess = await Promise.race([
-      findExistingGatewayProcess(sandbox),
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), 10_000)),
-    ]);
-  } catch {
-    // Treat as not running
-  }
-  const isGatewayReady = existingProcess !== null && existingProcess.status === 'running';
-
-  // Only restore from backup when the gateway needs to start.
-  // Restoring on every request (including WebSocket reconnects) would mount a
-  // FUSE overlay that interferes with createBackup — the SDK resets the overlay
-  // on backup, wiping upper-layer writes.
-  // NOTE: We do NOT call restoreIfNeeded here. Restore + gateway start are
-  // handled exclusively by /api/status (via waitUntil) to avoid races where
-  // the gateway starts before the FUSE overlay is mounted.
-
-  // For browser requests (non-WebSocket, non-API), show loading page if gateway isn't ready
   const isWebSocketRequest = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
   const acceptsHtml = request.headers.get('Accept')?.includes('text/html');
 
-  if (!isGatewayReady && !isWebSocketRequest && acceptsHtml) {
-    console.log('[PROXY] Gateway not ready, serving loading page');
-    // Don't start the gateway here — the loading page polls /api/status
-    // which handles restore + gateway start in the correct order.
-    // Starting from both places creates a race where the gateway may
-    // start before the restore completes.
-    return c.html(loadingPageHtml);
-  }
+  // For browser HTML requests, always try the proxy first but with a fallback
+  // to the loading page. This avoids calling listProcesses() which can hang
+  // on cold start (the DO RPC takes 30-60s and kills the Worker via CPU limit).
+  // The loading page polls /api/status which handles restore + gateway start.
 
-  // Ensure gateway is running (this will wait for startup)
-  try {
-    await ensureGateway(sandbox, c.env);
-  } catch (error) {
-    console.error('[PROXY] Failed to start gateway:', error);
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-
-    let hint = 'Check worker logs with: wrangler tail';
-    if (!c.env.ANTHROPIC_API_KEY) {
-      hint = 'ANTHROPIC_API_KEY is not set. Run: wrangler secret put ANTHROPIC_API_KEY';
-    } else if (errorMessage.includes('heap out of memory') || errorMessage.includes('OOM')) {
-      hint = 'Gateway ran out of memory. Try again or check for memory leaks.';
+  // For non-WebSocket, non-HTML requests (API calls, static assets), we need
+  // the gateway to be running. Try with a timeout — if it's not ready, return
+  // an error that the client can retry.
+  if (!isWebSocketRequest && !acceptsHtml) {
+    try {
+      await ensureGateway(sandbox, c.env);
+    } catch (error) {
+      console.error('[PROXY] Failed to start gateway:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      return c.json({ error: 'Gateway not ready', details: errorMessage }, 503);
     }
-
-    return c.json(
-      {
-        error: 'Gateway failed to start',
-        details: errorMessage,
-        hint,
-      },
-      503,
-    );
   }
+
+  // For HTML and WebSocket requests, try to proxy directly. If the gateway
+  // isn't running, containerFetch/wsConnect will throw and we serve the
+  // loading page (HTML) or return an error (WebSocket).
 
   // Proxy to gateway with WebSocket message interception
   if (isWebSocketRequest) {
@@ -497,8 +465,13 @@ app.all('*', async (c) => {
         httpResponse = await sandbox.containerFetch(request, GATEWAY_PORT);
       } catch (retryErr) {
         console.error('[HTTP] Retry after restart also failed:', retryErr);
+        if (acceptsHtml) return c.html(loadingPageHtml);
         return c.json({ error: 'Gateway crashed and recovery failed' }, 503);
       }
+    } else if (acceptsHtml) {
+      // Gateway not ready for HTML request — show loading page
+      console.log('[HTTP] Gateway not ready, serving loading page');
+      return c.html(loadingPageHtml);
     } else {
       console.error('[HTTP] Proxy error:', err);
       return c.json(

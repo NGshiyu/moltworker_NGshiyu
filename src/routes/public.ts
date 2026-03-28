@@ -39,25 +39,23 @@ publicRoutes.get('/api/status', async (c) => {
     let process = await findExistingGatewayProcess(sandbox);
     console.log('[api/status] existing process:', process?.id ?? 'none', process?.status ?? '');
     if (!process) {
-      // Kick off restore + gateway start in the background.
-      // We must NOT block the request — Workers have a 30s CPU time limit,
-      // and restore (15s) + gateway start (up to 180s) would exceed it.
-      // The loading page polls every 2s, so subsequent polls will find the
-      // running gateway.
-      console.log('[api/status] No process found, starting restore + gateway in background');
+      // Restore synchronously — restoreBackup is a fast RPC call (~1-3s).
+      // This MUST happen before ensureGateway or the gateway starts without
+      // the FUSE overlay.
+      try {
+        await restoreIfNeeded(sandbox, c.env.BACKUP_BUCKET);
+      } catch (err) {
+        console.error('[api/status] Restore failed:', err);
+      }
+
+      // Start the gateway in the background — this is slow (up to 180s for
+      // container start + openclaw onboard) and would exceed the Worker CPU
+      // limit if done synchronously. The loading page polls every 2s.
+      console.log('[api/status] No process found, starting gateway in background');
       c.executionCtx.waitUntil(
-        (async () => {
-          try {
-            await restoreIfNeeded(sandbox, c.env.BACKUP_BUCKET);
-          } catch (err) {
-            console.error('[api/status] Background restore failed:', err);
-          }
-          try {
-            await ensureGateway(sandbox, c.env);
-          } catch (err) {
-            console.error('[api/status] Background gateway start failed:', err);
-          }
-        })(),
+        ensureGateway(sandbox, c.env).catch((err: unknown) => {
+          console.error('[api/status] Background gateway start failed:', err);
+        }),
       );
       return c.json({ ok: false, status: 'starting' });
     }
